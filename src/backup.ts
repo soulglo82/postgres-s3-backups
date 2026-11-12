@@ -1,7 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { createGzip, createGunzip } from 'node:zlib';
 import { createHash } from 'node:crypto';
@@ -32,7 +32,7 @@ export function backupS3Client(): S3Client {
 // Do not interpolate DATABASE_URL into a shell command. In particular,
 // "pg_dump | gzip" previously reported gzip's zero exit status even if
 // pg_dump had failed. Both process exit statuses are now explicitly checked.
-async function dumpToGzip(destination: string): Promise<void> {
+export async function dumpToGzip(destination: string): Promise<void> {
   const extra = env.BACKUP_OPTIONS.trim()
     ? env.BACKUP_OPTIONS.trim().split(/\s+/).filter(Boolean)
     : [];
