@@ -6,7 +6,7 @@ import {
 import { backupS3Client, backupObjectKey } from './backup.js';
 import { env } from './env.js';
 
-async function audit() {
+export async function auditR2(): Promise<void> {
   const client = backupS3Client();
   try {
     const prefix = backupObjectKey(env.BACKUP_FILE_PREFIX + '-');
@@ -72,8 +72,12 @@ async function audit() {
   }
 }
 
-audit().catch((err) => {
-  // Never serialize SDK errors: endpoint, metadata or auth context can be sensitive.
-  console.error('Read-only R2 audit failed:', err instanceof Error ? err.name : 'Unknown');
-  process.exitCode = 1;
-});
+// A manual read-only check is still available, but the normal backup job
+// invokes the same function immediately after its successful readback.
+if (process.argv[1]?.endsWith('/audit.js')) {
+  auditR2().catch((err) => {
+    // Never serialize SDK errors: endpoint or auth context can be sensitive.
+    console.error('Read-only R2 audit failed:', err instanceof Error ? err.name : 'Unknown');
+    process.exitCode = 1;
+  });
+}
