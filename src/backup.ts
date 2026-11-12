@@ -1,119 +1,150 @@
-import { exec, execSync } from "child_process";
-import { S3Client, S3ClientConfig, PutObjectCommandInput } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
-import { createReadStream, unlink, statSync } from "fs";
-import { filesize } from "filesize";
-import path from "path";
-import os from "os";
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { createGzip, createGunzip } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import path from 'node:path';
+import os from 'node:os';
+import {
+  S3Client, S3ClientConfig, HeadObjectCommand, GetObjectCommand,
+} from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import { env } from './env.js';
 
-import { env } from "./env.js";
-import { createMD5 } from "./util.js";
+const execFileAsync = promisify(execFile);
+const REQUIRED_TABLES = ['families', 'children', 'point_events', 'rewards', 'uploads'];
 
-const uploadToS3 = async ({ name, path }: { name: string, path: string }) => {
-  console.log("Uploading backup to S3...");
+export function backupObjectKey(filename: string): string {
+  return env.BUCKET_SUBFOLDER ? env.BUCKET_SUBFOLDER.replace(/\/$/, '') + '/' + filename : filename;
+}
 
-  const bucket = env.AWS_S3_BUCKET;
-
-  const clientOptions: S3ClientConfig = {
+export function backupS3Client(): S3Client {
+  const config: S3ClientConfig = {
     region: env.AWS_S3_REGION,
-    forcePathStyle: env.AWS_S3_FORCE_PATH_STYLE
-  }
-
-  if (env.AWS_S3_ENDPOINT) {
-    console.log(`Using custom endpoint: ${env.AWS_S3_ENDPOINT}`);
-
-    clientOptions.endpoint = env.AWS_S3_ENDPOINT;
-  }
-
-  if (env.BUCKET_SUBFOLDER) {
-    name = env.BUCKET_SUBFOLDER + "/" + name;
-  }
-
-  let params: PutObjectCommandInput = {
-    Bucket: bucket,
-    Key: name,
-    Body: createReadStream(path),
-  }
-
-  if (env.SUPPORT_OBJECT_LOCK) {
-    console.log("MD5 hashing file...");
-
-    const md5Hash = await createMD5(path);
-
-    console.log("Done hashing file");
-
-    params.ContentMD5 = Buffer.from(md5Hash, 'hex').toString('base64');
-  }
-
-  const client = new S3Client(clientOptions);
-
-  await new Upload({
-    client,
-    params: params
-  }).done();
-
-  console.log("Backup uploaded to S3...");
+    forcePathStyle: env.AWS_S3_FORCE_PATH_STYLE,
+  };
+  if (env.AWS_S3_ENDPOINT) config.endpoint = env.AWS_S3_ENDPOINT;
+  return new S3Client(config);
 }
 
-const dumpToFile = async (filePath: string) => {
-  console.log("Dumping DB to file...");
-
-  await new Promise((resolve, reject) => {
-    exec(`pg_dump --dbname=${env.BACKUP_DATABASE_URL} --format=tar ${env.BACKUP_OPTIONS} | gzip > ${filePath}`, (error, stdout, stderr) => {
-      if (error) {
-        reject({ error: error, stderr: stderr.trimEnd() });
-        return;
-      }
-
-      // check if archive is valid and contains data
-      const isValidArchive = (execSync(`gzip -cd ${filePath} | head -c1`).length == 1) ? true : false;
-      if (isValidArchive == false) {
-        reject({ error: "Backup archive file is invalid or empty; check for errors above" });
-        return;
-      }
-
-      // not all text in stderr will be a critical error, print the error / warning
-      if (stderr != "") {
-        console.log({ stderr: stderr.trimEnd() });
-      }
-
-      console.log("Backup archive file is valid");
-      console.log("Backup filesize:", filesize(statSync(filePath).size));
-
-      // if stderr contains text, let the user know that it was potently just a warning message
-      if (stderr != "") {
-        console.log(`Potential warnings detected; Please ensure the backup file "${path.basename(filePath)}" contains all needed data`);
-      }
-
-      resolve(undefined);
-    });
+// Do not interpolate DATABASE_URL into a shell command. In particular,
+// "pg_dump | gzip" previously reported gzip's zero exit status even if
+// pg_dump had failed. Both process exit statuses are now explicitly checked.
+async function dumpToGzip(destination: string): Promise<void> {
+  const extra = env.BACKUP_OPTIONS.trim()
+    ? env.BACKUP_OPTIONS.trim().split(/\s+/).filter(Boolean)
+    : [];
+  if (extra.some(x => /["'\\]/.test(x))) {
+    throw new Error('BACKUP_OPTIONS must be individual whitespace-separated arguments without shell quoting');
+  }
+  const dump = spawn('pg_dump', [
+    '--dbname', env.BACKUP_DATABASE_URL, '--format=tar', ...extra,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let failureText = '';
+  dump.stderr.setEncoding('utf8');
+  dump.stderr.on('data', (text: string) => {
+    failureText = (failureText + text).slice(-4000);
   });
-
-  console.log("DB dumped to file...");
+  const dumpExit = new Promise<number>((resolve, reject) => {
+    dump.once('error', reject);
+    dump.once('close', (code) => resolve(code ?? -1));
+  });
+  const streamed = pipeline(dump.stdout, createGzip(), createWriteStream(destination, {
+    mode: 0o600,
+  }));
+  const results = await Promise.allSettled([dumpExit, streamed]);
+  if (results[0].status === 'rejected' || results[1].status === 'rejected' ||
+      results[0].value !== 0) {
+    // Do not include stderr or the pg_dump command here: either may contain
+    // a credential embedded in the connection string.
+    throw new Error('pg_dump or compression failed; refusing to upload backup');
+  }
+  if (failureText.trim()) console.warn('pg_dump emitted warnings (details withheld)');
 }
 
-const deleteFile = async (path: string) => {
-  console.log("Deleting file...");
-  await new Promise((resolve, reject) => {
-    unlink(path, (err) => {
-      reject({ error: err });
-      return;
-    });
-    resolve(undefined);
+// pg_restore --list validates the archive's table of contents, not a full
+// restore. A separate isolated restore drill is still mandatory.
+async function verifyArchive(gzipFile: string, tarFile: string): Promise<void> {
+  await pipeline(createReadStream(gzipFile), createGunzip(), createWriteStream(tarFile, {
+    mode: 0o600,
+  }));
+  const { stdout } = await execFileAsync('pg_restore', ['--list', tarFile], {
+    maxBuffer: 8 * 1024 * 1024,
   });
+  for (const name of REQUIRED_TABLES) {
+    if (!stdout.includes('TABLE DATA public ' + name)) {
+      throw new Error('Archive validation failed: missing required table ' + name);
+    }
+  }
+}
+
+async function sha256File(filename: string): Promise<{ hash: string, size: number }> {
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const data of createReadStream(filename)) {
+    const chunk = data as Buffer;
+    size += chunk.length;
+    hash.update(chunk);
+  }
+  return { hash: hash.digest('hex'), size };
+}
+
+async function verifyRemote(client: S3Client, key: string, expected: {
+  hash: string, size: number,
+}): Promise<void> {
+  const head = await client.send(new HeadObjectCommand({
+    Bucket: env.AWS_S3_BUCKET, Key: key,
+  }));
+  if (head.ContentLength !== expected.size) {
+    throw new Error('R2 object size does not match the original backup');
+  }
+  const object = await client.send(new GetObjectCommand({
+    Bucket: env.AWS_S3_BUCKET, Key: key,
+  }));
+  if (!object.Body) throw new Error('R2 object download did not return a body');
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const part of object.Body as unknown as AsyncIterable<Uint8Array>) {
+    hash.update(part);
+    size += part.length;
+  }
+  if (size !== expected.size || hash.digest('hex') !== expected.hash) {
+    throw new Error('R2 backup download checksum mismatch');
+  }
 }
 
 export const backup = async () => {
-  console.log("Initiating DB backup...");
-
-  const date = new Date().toISOString();
-  const timestamp = date.replace(/[:.]+/g, '-');
-  const filename = `${env.BACKUP_FILE_PREFIX}-${timestamp}.tar.gz`;
-  const filepath = path.join(os.tmpdir(), filename);
-
-  await dumpToFile(filepath);
-  await uploadToS3({ name: filename, path: filepath });
-  await deleteFile(filepath);
-
-  console.log("DB backup complete...");
-}
+  const work = await mkdtemp(path.join(os.tmpdir(), 'percy-pg-backup-'));
+  const filename = `${env.BACKUP_FILE_PREFIX}-${new Date().toISOString().replace(/[:.]+/g, '-')}.tar.gz`;
+  const gzipFile = path.join(work, 'archive.tar.gz');
+  const tarFile = path.join(work, 'archive.tar');
+  const key = backupObjectKey(filename);
+  const client = backupS3Client();
+  try {
+    console.log('Creating validated database backup...');
+    await dumpToGzip(gzipFile);
+    await verifyArchive(gzipFile, tarFile);
+    const digest = await sha256File(gzipFile);
+    if (digest.size < 1024) throw new Error('Backup archive suspiciously small');
+    console.log('Archive validated using pg_restore catalog; compressed bytes:', digest.size);
+    await new Upload({
+      client, params: {
+        Bucket: env.AWS_S3_BUCKET,
+        Key: key,
+        Body: createReadStream(gzipFile),
+      },
+    }).done();
+    if (env.BACKUP_VERIFY_READBACK) {
+      await verifyRemote(client, key, digest);
+      console.log('R2 readback SHA-256 and byte length match source');
+    } else {
+      console.warn('R2 readback verification is disabled; upload is not independently checked');
+    }
+    console.log('Database backup uploaded and validated');
+  } finally {
+    client.destroy();
+    await rm(work, { recursive: true, force: true });
+  }
+};
