@@ -47,8 +47,12 @@ export const env = envsafe({
     desc: 'Enables support for buckets with object lock by providing an MD5 hash with the backup file',
     default: false
   }),
+  BACKUP_VERIFY_READBACK: bool({
+    desc: 'After upload, download and verify SHA-256 and size. Defaults true.',
+    default: true,
+  }),
   BACKUP_OPTIONS: str({
-    desc: 'Any valid pg_dump option.',
+    desc: 'Individual whitespace-delimited pg_dump arguments; shell quoting is not supported.',
     default: '',
     allowEmpty: true,
   }),
